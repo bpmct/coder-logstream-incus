@@ -17,7 +17,6 @@ import (
 	incusclient "github.com/lxc/incus/v6/client"
 	incusapi "github.com/lxc/incus/v6/shared/api"
 	"golang.org/x/mod/semver"
-
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
 
@@ -130,7 +129,14 @@ func (s *incusLogStreamer) reconcile(ctx context.Context) {
 		if _, ok := s.active[name]; !ok {
 			iCtx, iCancel := context.WithCancel(ctx)
 			s.active[name] = iCancel
-			go s.streamInstance(iCtx, name, token)
+			go func(iCtx context.Context, name, token string) {
+				s.streamInstance(iCtx, name, token)
+				// Remove from active so that the next reconcile can restart it
+				// if the instance still exists (handles early-exit on 401 during build).
+				s.mu.Lock()
+				delete(s.active, name)
+				s.mu.Unlock()
+			}(iCtx, name, token)
 		}
 	}
 
@@ -170,7 +176,54 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 	client := agentsdk.New(s.opts.coderURL, agentsdk.WithFixedToken(token))
 	client.SDK.SetLogger(logger)
 
-	// Register log source.
+	// The workspace token may not be authorized until the build job completes.
+	// Retry the connection with 10s backoff until successful or context cancelled.
+	var logDest agentsdk.LogDest
+	var closeConn func()
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Fetch build info to determine server capabilities.
+		// The role query parameter was added in Coder v2.31.0.
+		buildInfo, buildInfoErr := client.SDK.BuildInfo(ctx)
+
+		supportsRole := buildInfoErr == nil && versionAtLeast(buildInfo.Version, "v2.31.0")
+		var connErr error
+		if supportsRole {
+			raw, _, err := client.ConnectRPC28WithRole(ctx, "logstream-incus")
+			if err == nil {
+				logDest = raw
+				closeConn = func() { _ = raw.DRPCConn().Close() }
+			} else {
+				connErr = err
+			}
+		} else {
+			raw, err := client.ConnectRPC20(ctx)
+			if err == nil {
+				logDest = raw
+				closeConn = func() { _ = raw.DRPCConn().Close() }
+			} else {
+				connErr = err
+			}
+		}
+
+		if connErr == nil {
+			break
+		}
+
+		logger.Warn(ctx, "connect to coder agent API (retrying in 10s)", slog.Error(connErr))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
+	defer closeConn()
+
+	// Register log source (best-effort, non-fatal).
 	_, err := client.PostLogSource(ctx, agentsdk.PostLogSourceRequest{
 		ID:          sourceUUID,
 		Icon:        "/icon/container.svg",
@@ -178,40 +231,10 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 	})
 	if err != nil {
 		logger.Error(ctx, "post log source", slog.Error(err))
-		// Continue anyway — logs will still be sent, just without the custom source metadata.
 	}
 
 	ls := agentsdk.NewLogSender(logger)
 	sl := ls.GetScriptLogger(sourceUUID)
-
-	// Fetch build info to determine server capabilities.
-	// The role query parameter was added in Coder v2.31.0. Servers at or
-	// above this version support ConnectRPC28WithRole, which sends
-	// role="logstream-incus" to skip connection monitoring.
-	buildInfo, buildInfoErr := client.SDK.BuildInfo(ctx)
-
-	var logDest agentsdk.LogDest
-	var closeConn func()
-
-	supportsRole := buildInfoErr == nil && versionAtLeast(buildInfo.Version, "v2.31.0")
-	if supportsRole {
-		agentConn, _, err := client.ConnectRPC28WithRole(ctx, "logstream-incus")
-		if err != nil {
-			logger.Error(ctx, "connect rpc28", slog.Error(err))
-			return
-		}
-		logDest = agentConn
-		closeConn = func() { _ = agentConn.DRPCConn().Close() }
-	} else {
-		agentConn, err := client.ConnectRPC20(ctx)
-		if err != nil {
-			logger.Error(ctx, "connect rpc20", slog.Error(err))
-			return
-		}
-		logDest = agentConn
-		closeConn = func() { _ = agentConn.DRPCConn().Close() }
-	}
-	defer closeConn()
 
 	gracefulCtx, gracefulCancel := context.WithCancel(context.Background())
 	defer gracefulCancel()
@@ -239,11 +262,9 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 	s.tailCloudInit(ctx, name, sendLine, logger)
 
 	// Flush remaining logs gracefully.
+	ls.Flush(sourceUUID)
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer flushCancel()
-	if err := sl.Flush(flushCtx); err != nil {
-		logger.Warn(flushCtx, "flush logs", slog.Error(err))
-	}
 	if err := ls.WaitUntilEmpty(flushCtx); err != nil {
 		logger.Warn(flushCtx, "wait for log queue", slog.Error(err))
 	}
@@ -402,3 +423,4 @@ func newColor(value ...color.Attribute) *color.Color {
 func versionAtLeast(version, minimum string) bool {
 	return semver.IsValid(version) && semver.Compare(version, minimum) >= 0
 }
+
