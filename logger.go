@@ -57,7 +57,7 @@ type incusLogStreamer struct {
 
 	mu     sync.Mutex
 	active map[string]context.CancelFunc // instance name → cancel
-	done   map[string]struct{}            // instances that completed streaming successfully
+	done   map[string]string             // instance name → token that completed streaming
 }
 
 func newIncusLogStreamer(ctx context.Context, opts incusLogStreamerOptions) (*incusLogStreamer, error) {
@@ -82,7 +82,7 @@ func newIncusLogStreamer(ctx context.Context, opts incusLogStreamerOptions) (*in
 		errChan:    make(chan error, 8),
 		cancelFunc: cancel,
 		active:     make(map[string]context.CancelFunc),
-		done:       make(map[string]struct{}),
+		done:       make(map[string]string),
 	}
 
 	go s.watchLoop(ctx)
@@ -129,8 +129,8 @@ func (s *incusLogStreamer) reconcile(ctx context.Context) {
 
 	// Start streamers for new instances (skip already-completed ones).
 	for name, token := range current {
-		if _, done := s.done[name]; done {
-			continue // already streamed to completion, no need to restart
+		if doneToken, done := s.done[name]; done && doneToken == token {
+			continue // already streamed to completion for this token, no need to restart
 		}
 		if _, ok := s.active[name]; !ok {
 			iCtx, iCancel := context.WithCancel(ctx)
@@ -144,7 +144,7 @@ func (s *incusLogStreamer) reconcile(ctx context.Context) {
 				s.mu.Lock()
 				delete(s.active, name)
 				if completed {
-					s.done[name] = struct{}{}
+					s.done[name] = token
 				}
 				s.mu.Unlock()
 			}(iCtx, name, token)
