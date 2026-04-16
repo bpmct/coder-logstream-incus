@@ -1,5 +1,14 @@
 # Changelog
 
+## [v0.1.3] - 2026-04-16
+
+### Added
+- `CHANGELOG.md` with release history for all prior versions.
+- `AGENTS.md` documenting non-obvious implementation decisions for future contributors and AI agents.
+- Release workflow now extracts the matching `CHANGELOG.md` section as the release body instead of auto-generating notes.
+
+---
+
 ## [v0.1.2] - 2026-04-16
 
 ### Added
