@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	incusclient "github.com/lxc/incus/v6/client"
 	incusapi "github.com/lxc/incus/v6/shared/api"
+	"golang.org/x/mod/semver"
 
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
@@ -54,8 +55,8 @@ type incusLogStreamer struct {
 	errChan    chan error
 	cancelFunc context.CancelFunc
 
-	mu      sync.Mutex
-	active  map[string]context.CancelFunc // instance name → cancel
+	mu     sync.Mutex
+	active map[string]context.CancelFunc // instance name → cancel
 }
 
 func newIncusLogStreamer(ctx context.Context, opts incusLogStreamerOptions) (*incusLogStreamer, error) {
@@ -86,7 +87,7 @@ func newIncusLogStreamer(ctx context.Context, opts incusLogStreamerOptions) (*in
 	return s, nil
 }
 
-// watchLoop polls Incus for instances every pollInterval, starting/stopping
+// watchLoop polls Incus for instances every 5s, starting/stopping
 // streaming goroutines as instances appear and disappear.
 func (s *incusLogStreamer) watchLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
@@ -143,7 +144,7 @@ func (s *incusLogStreamer) reconcile(ctx context.Context) {
 }
 
 // agentToken extracts the Coder agent token from an Incus instance config.
-// It checks both user.coder-agent-token (Incus user metadata) and
+// It checks user.coder-agent-token (Incus user metadata) and
 // environment.CODER_AGENT_TOKEN (cloud-init environment key).
 func agentToken(inst incusapi.Instance) string {
 	if t, ok := inst.Config["user.coder-agent-token"]; ok && t != "" {
@@ -183,28 +184,49 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 	ls := agentsdk.NewLogSender(logger)
 	sl := ls.GetScriptLogger(sourceUUID)
 
-	// Establish the RPC log destination.
-	arpc, err := client.ConnectRPC20(ctx)
-	if err != nil {
-		logger.Error(ctx, "connect rpc", slog.Error(err))
-		return
+	// Fetch build info to determine server capabilities.
+	// The role query parameter was added in Coder v2.31.0. Servers at or
+	// above this version support ConnectRPC28WithRole, which sends
+	// role="logstream-incus" to skip connection monitoring.
+	buildInfo, buildInfoErr := client.SDK.BuildInfo(ctx)
+
+	var logDest agentsdk.LogDest
+	var closeConn func()
+
+	supportsRole := buildInfoErr == nil && versionAtLeast(buildInfo.Version, "v2.31.0")
+	if supportsRole {
+		agentConn, _, err := client.ConnectRPC28WithRole(ctx, "logstream-incus")
+		if err != nil {
+			logger.Error(ctx, "connect rpc28", slog.Error(err))
+			return
+		}
+		logDest = agentConn
+		closeConn = func() { _ = agentConn.DRPCConn().Close() }
+	} else {
+		agentConn, err := client.ConnectRPC20(ctx)
+		if err != nil {
+			logger.Error(ctx, "connect rpc20", slog.Error(err))
+			return
+		}
+		logDest = agentConn
+		closeConn = func() { _ = agentConn.DRPCConn().Close() }
 	}
-	defer arpc.DRPCConn().Close()
+	defer closeConn()
 
 	gracefulCtx, gracefulCancel := context.WithCancel(context.Background())
 	defer gracefulCancel()
 
 	go func() {
-		if err := ls.SendLoop(gracefulCtx, arpc); err != nil && ctx.Err() == nil {
+		if err := ls.SendLoop(gracefulCtx, logDest); err != nil && ctx.Err() == nil {
 			logger.Warn(gracefulCtx, "send loop exited", slog.Error(err))
 		}
 	}()
 
-	sendLine := func(line string) {
+	sendLine := func(line string, level codersdk.LogLevel) {
 		if err := sl.Send(ctx, agentsdk.Log{
 			CreatedAt: time.Now(),
 			Output:    line,
-			Level:     codersdk.LogLevelInfo,
+			Level:     level,
 		}); err != nil && ctx.Err() == nil {
 			logger.Warn(ctx, "send log line", slog.Error(err))
 		}
@@ -230,7 +252,7 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 }
 
 // dumpConsoleLog reads the full console log buffer and sends each line.
-func (s *incusLogStreamer) dumpConsoleLog(ctx context.Context, name string, sendLine func(string), logger slog.Logger) {
+func (s *incusLogStreamer) dumpConsoleLog(ctx context.Context, name string, sendLine func(string, codersdk.LogLevel), logger slog.Logger) {
 	rc, err := s.incus.GetInstanceConsoleLog(name, nil)
 	if err != nil {
 		logger.Warn(ctx, "get console log", slog.Error(err))
@@ -238,13 +260,13 @@ func (s *incusLogStreamer) dumpConsoleLog(ctx context.Context, name string, send
 	}
 	defer rc.Close()
 
-	sendLine(newColor(color.Bold).Sprintf("=== Incus console log: %s ===", name))
+	sendLine(newColor(color.Bold).Sprintf("=== Incus console log: %s ===", name), codersdk.LogLevelInfo)
 	scanner := bufio.NewScanner(rc)
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return
 		}
-		sendLine(scanner.Text())
+		sendLine(scanner.Text(), codersdk.LogLevelInfo)
 	}
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		logger.Warn(ctx, "scan console log", slog.Error(err))
@@ -256,7 +278,7 @@ func (s *incusLogStreamer) dumpConsoleLog(ctx context.Context, name string, send
 //   - cloud-init finishes (/run/cloud-init/result.json exists), or
 //   - context is cancelled, or
 //   - the instance disappears.
-func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendLine func(string), logger slog.Logger) {
+func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendLine func(string, codersdk.LogLevel), logger slog.Logger) {
 	ticker := time.NewTicker(cloudInitPollInterval)
 	defer ticker.Stop()
 
@@ -274,7 +296,7 @@ func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendL
 		if s.fileExists(name, cloudInitResultPath) {
 			// Do one final read before exiting.
 			offset = s.readCloudInitChunk(ctx, name, offset, &headerSent, sendLine, logger)
-			sendLine(newColor(color.FgGreen).Sprint("cloud-init: finished (result.json present)"))
+			sendLine(newColor(color.FgGreen).Sprint("cloud-init: finished ✓"), codersdk.LogLevelInfo)
 			return
 		}
 
@@ -284,10 +306,10 @@ func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendL
 
 // readCloudInitChunk reads new content from cloud-init-output.log starting at
 // offset and returns the new offset.
-func (s *incusLogStreamer) readCloudInitChunk(ctx context.Context, name string, offset int64, headerSent *bool, sendLine func(string), logger slog.Logger) int64 {
+func (s *incusLogStreamer) readCloudInitChunk(ctx context.Context, name string, offset int64, headerSent *bool, sendLine func(string, codersdk.LogLevel), logger slog.Logger) int64 {
 	rc, resp, err := s.incus.GetInstanceFile(name, cloudInitLogPath)
 	if err != nil {
-		// File may not exist yet — that's expected early in boot.
+		// File may not exist yet — expected early in boot.
 		if !strings.Contains(err.Error(), "No such file") &&
 			!strings.Contains(err.Error(), "not found") &&
 			!strings.Contains(err.Error(), "404") {
@@ -301,7 +323,8 @@ func (s *incusLogStreamer) readCloudInitChunk(ctx context.Context, name string, 
 		return offset
 	}
 
-	// Seek to last-read offset if possible (the reader is raw; we skip bytes).
+	// Skip bytes already read (the Incus file API doesn't support range reads,
+	// so we manually discard the already-sent portion).
 	if offset > 0 {
 		buf := make([]byte, 32*1024)
 		var skipped int64
@@ -329,7 +352,7 @@ func (s *incusLogStreamer) readCloudInitChunk(ctx context.Context, name string, 
 	}
 
 	if !*headerSent {
-		sendLine(newColor(color.Bold).Sprintf("=== cloud-init output: %s ===", name))
+		sendLine(newColor(color.Bold).Sprintf("=== cloud-init output: %s ===", name), codersdk.LogLevelInfo)
 		*headerSent = true
 	}
 
@@ -342,7 +365,7 @@ func (s *incusLogStreamer) readCloudInitChunk(ctx context.Context, name string, 
 		if line == "" {
 			continue
 		}
-		sendLine(line)
+		sendLine(line, codersdk.LogLevelInfo)
 	}
 
 	return offset + int64(len(data))
@@ -372,4 +395,10 @@ func newColor(value ...color.Attribute) *color.Color {
 	c := color.New(value...)
 	c.EnableColor()
 	return c
+}
+
+// versionAtLeast returns true if version is a valid semver string and is
+// greater than or equal to minimum.
+func versionAtLeast(version, minimum string) bool {
+	return semver.IsValid(version) && semver.Compare(version, minimum) >= 0
 }
