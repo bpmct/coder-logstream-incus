@@ -17,6 +17,7 @@ import (
 	incusclient "github.com/lxc/incus/v6/client"
 	incusapi "github.com/lxc/incus/v6/shared/api"
 	"golang.org/x/mod/semver"
+
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/codersdk/agentsdk"
 
@@ -56,6 +57,7 @@ type incusLogStreamer struct {
 
 	mu     sync.Mutex
 	active map[string]context.CancelFunc // instance name → cancel
+	done   map[string]struct{}            // instances that completed streaming successfully
 }
 
 func newIncusLogStreamer(ctx context.Context, opts incusLogStreamerOptions) (*incusLogStreamer, error) {
@@ -80,6 +82,7 @@ func newIncusLogStreamer(ctx context.Context, opts incusLogStreamerOptions) (*in
 		errChan:    make(chan error, 8),
 		cancelFunc: cancel,
 		active:     make(map[string]context.CancelFunc),
+		done:       make(map[string]struct{}),
 	}
 
 	go s.watchLoop(ctx)
@@ -124,27 +127,40 @@ func (s *incusLogStreamer) reconcile(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Start streamers for new instances.
+	// Start streamers for new instances (skip already-completed ones).
 	for name, token := range current {
+		if _, done := s.done[name]; done {
+			continue // already streamed to completion, no need to restart
+		}
 		if _, ok := s.active[name]; !ok {
 			iCtx, iCancel := context.WithCancel(ctx)
 			s.active[name] = iCancel
 			go func(iCtx context.Context, name, token string) {
-				s.streamInstance(iCtx, name, token)
-				// Remove from active so that the next reconcile can restart it
-				// if the instance still exists (handles early-exit on 401 during build).
+				completed := s.streamInstance(iCtx, name, token)
+				// Remove from active. If completed normally, mark done so we
+				// don't restart on the next reconcile. If not completed (e.g.
+				// 401 during build, context cancelled), omit from done so
+				// reconcile can retry.
 				s.mu.Lock()
 				delete(s.active, name)
+				if completed {
+					s.done[name] = struct{}{}
+				}
 				s.mu.Unlock()
 			}(iCtx, name, token)
 		}
 	}
 
-	// Cancel streamers for gone instances.
+	// Cancel streamers for gone instances and clean up done map.
 	for name, cancel := range s.active {
 		if _, ok := current[name]; !ok {
 			cancel()
 			delete(s.active, name)
+		}
+	}
+	for name := range s.done {
+		if _, ok := current[name]; !ok {
+			delete(s.done, name)
 		}
 	}
 }
@@ -169,7 +185,9 @@ func agentToken(inst incusapi.Instance) string {
 }
 
 // streamInstance is the per-VM goroutine that sends logs to Coder.
-func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token string) {
+// It returns true if cloud-init streaming completed normally, false if it
+// exited early (context cancelled, 401 during build, etc.).
+func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token string) bool {
 	logger := s.opts.logger.With(slog.F("instance", name))
 	logger.Info(ctx, "starting log stream for instance")
 
@@ -183,7 +201,7 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 
 	for {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 
 		// Fetch build info to determine server capabilities.
@@ -217,7 +235,7 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 		logger.Warn(ctx, "connect to coder agent API (retrying in 10s)", slog.Error(connErr))
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(10 * time.Second):
 		}
 	}
@@ -255,11 +273,11 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 		}
 	}
 
-	// 1. Dump the console log buffer (one-shot).
+	// 1. Dump the console log buffer (one-shot; containers only — VMs don't support it).
 	s.dumpConsoleLog(ctx, name, sendLine, logger)
 
 	// 2. Tail cloud-init-output.log until done or context cancelled.
-	s.tailCloudInit(ctx, name, sendLine, logger)
+	completed := s.tailCloudInit(ctx, name, sendLine, logger)
 
 	// Flush remaining logs gracefully.
 	ls.Flush(sourceUUID)
@@ -270,13 +288,17 @@ func (s *incusLogStreamer) streamInstance(ctx context.Context, name, token strin
 	}
 
 	logger.Info(ctx, "log stream finished for instance")
+	return completed
 }
 
 // dumpConsoleLog reads the full console log buffer and sends each line.
+// This only works for Incus containers; VMs use a different mechanism
+// and will return an error which is silently ignored.
 func (s *incusLogStreamer) dumpConsoleLog(ctx context.Context, name string, sendLine func(string, codersdk.LogLevel), logger slog.Logger) {
 	rc, err := s.incus.GetInstanceConsoleLog(name, nil)
 	if err != nil {
-		logger.Warn(ctx, "get console log", slog.Error(err))
+		// VMs don't support the console log buffer API — this is expected and not an error.
+		logger.Debug(ctx, "get console log (skipping)", slog.Error(err))
 		return
 	}
 	defer rc.Close()
@@ -295,11 +317,13 @@ func (s *incusLogStreamer) dumpConsoleLog(ctx context.Context, name string, send
 }
 
 // tailCloudInit polls /var/log/cloud-init-output.log via the Incus file API,
-// sending new lines every cloudInitPollInterval.  It stops when:
+// sending new lines every cloudInitPollInterval. It stops when:
 //   - cloud-init finishes (/run/cloud-init/result.json exists), or
 //   - context is cancelled, or
 //   - the instance disappears.
-func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendLine func(string, codersdk.LogLevel), logger slog.Logger) {
+//
+// Returns true if cloud-init completed normally, false if context was cancelled.
+func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendLine func(string, codersdk.LogLevel), logger slog.Logger) bool {
 	ticker := time.NewTicker(cloudInitPollInterval)
 	defer ticker.Stop()
 
@@ -309,7 +333,7 @@ func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendL
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-ticker.C:
 		}
 
@@ -318,7 +342,7 @@ func (s *incusLogStreamer) tailCloudInit(ctx context.Context, name string, sendL
 			// Do one final read before exiting.
 			offset = s.readCloudInitChunk(ctx, name, offset, &headerSent, sendLine, logger)
 			sendLine(newColor(color.FgGreen).Sprint("cloud-init: finished ✓"), codersdk.LogLevelInfo)
-			return
+			return true
 		}
 
 		offset = s.readCloudInitChunk(ctx, name, offset, &headerSent, sendLine, logger)
@@ -423,4 +447,3 @@ func newColor(value ...color.Attribute) *color.Color {
 func versionAtLeast(version, minimum string) bool {
 	return semver.IsValid(version) && semver.Compare(version, minimum) >= 0
 }
-
