@@ -4,6 +4,8 @@
 
 Stream Incus VM console and cloud-init logs to [Coder](https://coder.com) workspace startup logs — analogous to [`coder-logstream-kube`](https://github.com/coder/coder-logstream-kube) for Kubernetes.
 
+![Workspace startup logs showing cloud-init output streamed by coder-logstream-incus](screenshot.png)
+
 ## How it works
 
 The daemon runs on the same host as `incusd`. It polls the Incus API every 5 seconds for instances that have the `user.coder-agent-token` config key set. When a new instance is found, it:
